@@ -1,0 +1,1 @@
+"""Deterministic patch validation components."""
