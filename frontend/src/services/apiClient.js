@@ -88,36 +88,65 @@ function responseError(response, payload) {
 export function createApiClient({ baseUrl = DEFAULT_API_BASE_URL, fetchImpl = globalThis.fetch, documentRef = globalThis.document } = {}) {
   const origin = String(baseUrl).replace(/\\+$/, "");
   let csrfTokenCache = "";
-  let csrfRefreshPromise = null; // avoid concurrent refreshes
+  let csrfTokenVersion = 0; // bumped whenever the server hands us a token
+  let csrfRefreshPromise = null; // shared so concurrent callers trigger one refresh
 
-  // fetch CSRF token without triggering the retry loop
-  async function fetchCsrfToken(signal) {
-    const resp = await fetchImpl(`${origin}${CSRF_ENDPOINT}`, {
-      method: "GET",
-      credentials: "include",
-      cache: "no-store",
-      signal,
-      headers: {},
-    });
+  function storeCsrfToken(token) {
+    csrfTokenCache = token;
+    csrfTokenVersion += 1;
+  }
+
+  // Fetch a CSRF token without triggering the retry loop. No caller AbortSignal is used
+  // here: this request is shared, so one caller aborting must not fail the others.
+  async function fetchCsrfToken() {
+    let resp;
+    try {
+      resp = await fetchImpl(`${origin}${CSRF_ENDPOINT}`, {
+        method: "GET",
+        credentials: "include",
+        cache: "no-store",
+        headers: {},
+      });
+    } catch {
+      throw new ApiError({ code: "network_error", message: "Could not reach the CodeWise API. Check your connection and retry." });
+    }
     const payload = await parseResponse(resp);
     if (!resp.ok) {
       throw responseError(resp, payload);
     }
     if (typeof payload?.csrfToken === "string") {
-      csrfTokenCache = payload.csrfToken;
+      storeCsrfToken(payload.csrfToken);
     }
     return payload;
   }
 
-  // Core request sender with CSRF handling and single retry
+  // Single shared refresh. The slot is cleared when this exact promise settles, on
+  // success or failure, so a failed refresh never poisons later requests.
+  function refreshCsrfToken() {
+    if (!csrfRefreshPromise) {
+      const refresh = fetchCsrfToken().finally(() => {
+        if (csrfRefreshPromise === refresh) csrfRefreshPromise = null;
+      });
+      csrfRefreshPromise = refresh;
+    }
+    return csrfRefreshPromise;
+  }
+
+  // Core request sender with CSRF handling and a single retry
   async function send(path, { method = "GET", body, idempotencyKey, signal } = {}) {
     validatePath(path);
     const normalizedMethod = method.toUpperCase();
+    const changesState = ["POST", "PUT", "PATCH", "DELETE"].includes(normalizedMethod);
+    // Generated once per original request so a retry reuses exactly the same key.
+    const requestKey = normalizedMethod === "POST" && path !== CSRF_ENDPOINT
+      ? (idempotencyKey || createRequestKey())
+      : undefined;
     let hasRetried = false;
     while (true) {
       // Build fresh headers for each attempt
       const headers = { Accept: "application/json" };
       const options = { method: normalizedMethod, headers, credentials: "include", cache: "no-store", signal };
+      let tokenVersion = csrfTokenVersion;
 
       if (body !== undefined) {
         if (!body || typeof body !== "object" || Array.isArray(body)) {
@@ -128,27 +157,18 @@ export function createApiClient({ baseUrl = DEFAULT_API_BASE_URL, fetchImpl = gl
       }
 
       // Attach CSRF token and Idempotency-Key when needed
-      if (["POST", "PUT", "PATCH", "DELETE"].includes(normalizedMethod)) {
-        // Prefer token from cookie, fallback to cache
-        let token = readCookie("csrftoken", documentRef) || csrfTokenCache;
+      if (changesState) {
+        // A token issued by the server (bootstrap, refresh, login rotation) always wins over a
+        // possibly stale readable cookie. The cookie is only used before any token was issued.
+        let token = csrfTokenCache || readCookie("csrftoken", documentRef);
 
         // Bootstrap a token if one is still unavailable (and this is not the CSRF endpoint itself)
         if (!token && path !== CSRF_ENDPOINT) {
-          if (!csrfRefreshPromise) {
-            csrfRefreshPromise = (async () => {
-              try {
-                await fetchCsrfToken(signal);
-              } finally {
-                csrfRefreshPromise = null;
-              }
-            })();
-          }
-          await csrfRefreshPromise;
-          // After refresh, read the token again (may be in cache or cookie)
-          token = readCookie("csrftoken", documentRef) || csrfTokenCache;
+          await refreshCsrfToken();
+          token = csrfTokenCache || readCookie("csrftoken", documentRef);
         }
 
-        // If still missing token for a state‑changing request, abort
+        // If still missing token for a state-changing request, abort
         if (!token && path !== CSRF_ENDPOINT) {
           throw new ApiError({
             status: 403,
@@ -157,18 +177,17 @@ export function createApiClient({ baseUrl = DEFAULT_API_BASE_URL, fetchImpl = gl
           });
         }
 
-        console.log('DEBUG token before header:', token);
-if (token) {
+        tokenVersion = csrfTokenVersion;
+        if (token) {
           headers["X-CSRFToken"] = token;
         }
 
-        // Attach Idempotency‑Key to POST requests (except CSRF endpoint)
-        if (normalizedMethod === "POST" && path !== CSRF_ENDPOINT) {
-          headers["Idempotency-Key"] = idempotencyKey || createRequestKey();
+        if (requestKey) {
+          headers["Idempotency-Key"] = requestKey;
         }
       }
 
-      console.log('OPTIONS HEADERS BEFORE FETCH', options.headers);
+      let response;
       try {
         response = await fetchImpl(`${origin}${path}`, options);
       } catch (error) {
@@ -177,23 +196,18 @@ if (token) {
       }
       const payload = await parseResponse(response);
       if (response.ok) {
-        if (typeof payload?.csrfToken === "string") csrfTokenCache = payload.csrfToken;
+        if (typeof payload?.csrfToken === "string") storeCsrfToken(payload.csrfToken);
         return payload;
       }
       const err = responseError(response, payload);
       if (!hasRetried && err.code === "csrf_failed") {
         hasRetried = true;
-        if (!csrfRefreshPromise) {
-          csrfRefreshPromise = (async () => {
-            try {
-              await fetchCsrfToken(signal);
-            } finally {
-              csrfRefreshPromise = null;
-            }
-          })();
+        // If another request already refreshed the token since this one was built, just retry
+        // with it; otherwise join (or start) the shared refresh.
+        if (csrfTokenVersion === tokenVersion) {
+          await refreshCsrfToken();
         }
-        await csrfRefreshPromise;
-        continue; // retry after refreshed token
+        continue; // retry once with the refreshed token
       }
       throw err;
     }
