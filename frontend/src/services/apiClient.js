@@ -109,10 +109,7 @@ export function createApiClient({ baseUrl = DEFAULT_API_BASE_URL, fetchImpl = gl
     return payload;
   }
 
-
-  
-
-    // Core request sender with CSRF handling and single retry
+  // Core request sender with CSRF handling and single retry
   async function send(path, { method = "GET", body, idempotencyKey, signal } = {}) {
     validatePath(path);
     const normalizedMethod = method.toUpperCase();
@@ -130,57 +127,48 @@ export function createApiClient({ baseUrl = DEFAULT_API_BASE_URL, fetchImpl = gl
         options.body = JSON.stringify(body);
       }
 
-              // Attach CSRF token and Idempotency-Key when needed
-        if (["POST", "PUT", "PATCH", "DELETE"].includes(normalizedMethod)) {
-          // 1. Prefer the token already present in the cookie.
-          let token = readCookie("csrftoken", documentRef) || csrfTokenCache;
+      // Attach CSRF token and Idempotency-Key when needed
+      if (["POST", "PUT", "PATCH", "DELETE"].includes(normalizedMethod)) {
+        // Prefer token from cookie, fallback to cache
+        let token = readCookie("csrftoken", documentRef) || csrfTokenCache;
 
-          // 2. Fall back to the cached token.
-          if (!token) token = csrfTokenCache;
-
-          // 3. Bootstrap a token if one is still unavailable.
-          if (!token && path !== CSRF_ENDPOINT) {
-            if (!csrfRefreshPromise) {
-              csrfRefreshPromise = (async () => {
-                try {
-                  await fetchCsrfToken(signal);
-                } finally {
-                  csrfRefreshPromise = null;
-                }
-              })();
-            }
-
-            await csrfRefreshPromise;
-
-            // Read the refreshed token from the cache (refresh may have updated cookie in real env).
-            token = csrfTokenCache || readCookie("csrftoken", documentRef);
-          }
-
-          // 4. Never send a state-changing request without a valid CSRF token.
-          if (!token && path !== CSRF_ENDPOINT) {
-            throw new ApiError(
-              "The browser security token is unavailable. Refresh the page and try again.",
-              {
-                status: 403,
-                code: "csrf_token_unavailable",
+        // Bootstrap a token if one is still unavailable (and this is not the CSRF endpoint itself)
+        if (!token && path !== CSRF_ENDPOINT) {
+          if (!csrfRefreshPromise) {
+            csrfRefreshPromise = (async () => {
+              try {
+                await fetchCsrfToken(signal);
+              } finally {
+                csrfRefreshPromise = null;
               }
-            );
+            })();
           }
-
-
-          if (token) {
-            headers["X-CSRFToken"] = token;
-          }
-
-          }
-
-          // 5. Attach an idempotency key to POST requests.
-          if (normalizedMethod === "POST" && path !== CSRF_ENDPOINT) {
-            headers["Idempotency-Key"] = idempotencyKey || createRequestKey();
-          }
+          await csrfRefreshPromise;
+          // After refresh, read the token again (may be in cache or cookie)
+          token = readCookie("csrftoken", documentRef) || csrfTokenCache;
         }
 
-      let response;
+        // If still missing token for a state‑changing request, abort
+        if (!token && path !== CSRF_ENDPOINT) {
+          throw new ApiError({
+            status: 403,
+            code: "csrf_token_unavailable",
+            message: "The browser security token is unavailable. Refresh the page and try again."
+          });
+        }
+
+        console.log('DEBUG token before header:', token);
+if (token) {
+          headers["X-CSRFToken"] = token;
+        }
+
+        // Attach Idempotency‑Key to POST requests (except CSRF endpoint)
+        if (normalizedMethod === "POST" && path !== CSRF_ENDPOINT) {
+          headers["Idempotency-Key"] = idempotencyKey || createRequestKey();
+        }
+      }
+
+      console.log('OPTIONS HEADERS BEFORE FETCH', options.headers);
       try {
         response = await fetchImpl(`${origin}${path}`, options);
       } catch (error) {
@@ -196,7 +184,13 @@ export function createApiClient({ baseUrl = DEFAULT_API_BASE_URL, fetchImpl = gl
       if (!hasRetried && err.code === "csrf_failed") {
         hasRetried = true;
         if (!csrfRefreshPromise) {
-          csrfRefreshPromise = (async () => { try { await fetchCsrfToken(signal); } finally { csrfRefreshPromise = null; } })();
+          csrfRefreshPromise = (async () => {
+            try {
+              await fetchCsrfToken(signal);
+            } finally {
+              csrfRefreshPromise = null;
+            }
+          })();
         }
         await csrfRefreshPromise;
         continue; // retry after refreshed token
@@ -205,14 +199,12 @@ export function createApiClient({ baseUrl = DEFAULT_API_BASE_URL, fetchImpl = gl
     }
   }
 
-
   return {
     get(path, options = {}) { return send(path, { ...options, method: "GET" }); },
     post(path, body, options = {}) { return send(path, { ...options, method: "POST", body }); },
     request: send,
   };
 }
-
 
 const apiClient = createApiClient();
 export const apiGet = (path, options) => apiClient.get(path, options);
