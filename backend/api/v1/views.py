@@ -7,13 +7,13 @@ from django.conf import settings
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_protect, ensure_csrf_cookie
 from django.http import Http404
-from rest_framework.authentication import SessionAuthentication
 from rest_framework.exceptions import APIException
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.renderers import JSONRenderer
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from api.csrf import CsrfAwareSessionAuthentication
 from apps.repositories.errors import RepositoryGrantRequired, SnapshotNotSealed, WorkspaceAccessDenied
 from apps.repositories.models import RepositorySubmission, WorkflowExecution, WorkspaceMembership
 from apps.repositories.services import get_submission, require_workspace_membership
@@ -24,7 +24,7 @@ from .services import (APIServiceError, _configured_runtime, _idempotency_key, a
 
 
 class AuthenticatedAPIView(APIView):
-    authentication_classes = [SessionAuthentication]
+    authentication_classes = [CsrfAwareSessionAuthentication]
     permission_classes = [IsAuthenticated]
     renderer_classes = [JSONRenderer]
 
@@ -78,7 +78,7 @@ class CsrfTokenView(APIView):
 
 
 class SessionView(APIView):
-    authentication_classes = [SessionAuthentication]
+    authentication_classes = [CsrfAwareSessionAuthentication]
     permission_classes = [AllowAny]
     renderer_classes = [JSONRenderer]
 
