@@ -164,6 +164,8 @@ SESSION_COOKIE_SECURE = not DEBUG
 CSRF_COOKIE_SECURE = not DEBUG
 SESSION_COOKIE_SAMESITE = "Lax"
 CSRF_COOKIE_SAMESITE = "Lax"
+# JSON {"error": "csrf_failed"} instead of Django's HTML 403 page (see api/csrf.py).
+CSRF_FAILURE_VIEW = "api.csrf.csrf_failure"
 try:
     SECURE_HSTS_SECONDS = int(os.environ.get("DJANGO_SECURE_HSTS_SECONDS", "0"))
 except ValueError as exc:
@@ -195,8 +197,10 @@ LOGGING = {
 }
 
 REST_FRAMEWORK = {
-    # Session authentication is CSRF-protected by Django middleware. Public health
-    # explicitly opts out on its own view.
+    # DRF exempts its views from CsrfViewMiddleware and enforces CSRF inside
+    # SessionAuthentication instead. Every view in api.v1.views sets its own authentication
+    # classes (CsrfAwareSessionAuthentication for session views) so CSRF rejections carry
+    # the stable "csrf_failed" code. This default is a fail-closed fallback only.
     "DEFAULT_AUTHENTICATION_CLASSES": ["rest_framework.authentication.SessionAuthentication"],
     "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.IsAuthenticated"],
     "UNAUTHENTICATED_USER": None,
